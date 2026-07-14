@@ -121,6 +121,25 @@ fn clear_instruction_messages(model: &mut ModelInfo) {
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+    fallback_model_info(slug)
+}
+
+/// Build a picker-visible descriptor for a model served by a local/OSS provider.
+///
+/// Unlike [`model_info_from_slug`], this does not warn (the model is not
+/// "unknown" — it was discovered from the provider's own `/models` endpoint)
+/// and marks the model as picker-visible so it appears in `/model` and can be
+/// selected as the default.
+pub fn model_info_for_local_provider(slug: &str) -> ModelInfo {
+    let mut info = fallback_model_info(slug);
+    info.visibility = ModelVisibility::List;
+    // These models were discovered from the provider's own /models endpoint, so
+    // they are not "missing" — avoid the fallback-metadata user warning.
+    info.used_fallback_model_metadata = false;
+    info
+}
+
+fn fallback_model_info(slug: &str) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),

@@ -499,3 +499,52 @@ refresh_interval_ms = 0
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
 }
+
+#[test]
+fn test_has_provider_models_endpoint() {
+    // Local OSS providers expose their own open /models endpoint.
+    let ollama = create_oss_provider_with_base_url(
+        "http://localhost:11434/v1",
+        WireApi::Responses,
+    );
+    assert!(ollama.has_provider_models_endpoint());
+
+    let lmstudio = create_oss_provider_with_base_url(
+        "http://localhost:1234/v1",
+        WireApi::Responses,
+    );
+    assert!(lmstudio.has_provider_models_endpoint());
+
+    // The OpenAI-hosted backend relies on Codex backend auth, not its own refresh.
+    let openai = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    assert!(!openai.has_provider_models_endpoint());
+
+    // Even with a custom base URL, the OpenAI provider is excluded (handled via
+    // uses_codex_backend / has_command_auth instead).
+    let openai_proxy =
+        ModelProviderInfo::create_openai_provider(Some("https://proxy.example.com/v1".into()));
+    assert!(!openai_proxy.has_provider_models_endpoint());
+
+    // Amazon Bedrock does not expose /models over the OpenAI-compatible surface.
+    let bedrock = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
+    assert!(!bedrock.has_provider_models_endpoint());
+
+    // A user-defined custom provider with a base URL does expose /models.
+    let custom: ModelProviderInfo = toml::from_str(
+        r#"
+name = "Custom"
+base_url = "https://custom.example.com/v1"
+"#,
+    )
+    .unwrap();
+    assert!(custom.has_provider_models_endpoint());
+
+    // A provider without a base URL has no endpoint to query.
+    let no_base_url: ModelProviderInfo = toml::from_str(
+        r#"
+name = "Custom"
+"#,
+    )
+    .unwrap();
+    assert!(!no_base_url.has_provider_models_endpoint());
+}

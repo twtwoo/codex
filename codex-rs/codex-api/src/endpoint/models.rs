@@ -48,6 +48,31 @@ impl<T: HttpTransport> ModelsClient<T> {
         request_url: String,
         extra_headers: HeaderMap,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
+        let (body, header_etag) = self.fetch_models_response(request_url, extra_headers).await?;
+
+        let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&body).map_err(
+            |e| {
+                ApiError::Stream(format!(
+                    "failed to decode models response: {e}; body: {}",
+                    String::from_utf8_lossy(&body)
+                ))
+            },
+        )?;
+
+        Ok((models, header_etag))
+    }
+
+    /// Fetch the raw `/models` response body and optional ETag without parsing.
+    ///
+    /// Callers that speak a different response shape than the Codex backend's
+    /// rich `ModelsResponse` (e.g. local OSS providers returning the
+    /// OpenAI-compatible `{"object":"list","data":[{"id":...}]}` shape) can use
+    /// this to retrieve the bytes and decode them themselves.
+    pub async fn fetch_models_response(
+        &self,
+        request_url: String,
+        extra_headers: HeaderMap,
+    ) -> Result<(Vec<u8>, Option<String>), ApiError> {
         let resp = self
             .session
             .execute_with(
@@ -67,15 +92,7 @@ impl<T: HttpTransport> ModelsClient<T> {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
-            .map_err(|e| {
-                ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
-                ))
-            })?;
-
-        Ok((models, header_etag))
+        Ok((resp.body.to_vec(), header_etag))
     }
 }
 

@@ -78,6 +78,7 @@ fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
 struct TestModelsEndpoint {
     has_command_auth: bool,
     uses_codex_backend: bool,
+    has_provider_models_endpoint: bool,
     responses: Mutex<VecDeque<Vec<ModelInfo>>>,
     fetch_count: AtomicUsize,
     observed_proxy_policy: Mutex<Option<OutboundProxyPolicy>>,
@@ -88,6 +89,7 @@ impl TestModelsEndpoint {
         Arc::new(Self {
             has_command_auth: false,
             uses_codex_backend: true,
+            has_provider_models_endpoint: false,
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
             observed_proxy_policy: Mutex::new(None),
@@ -98,6 +100,20 @@ impl TestModelsEndpoint {
         Arc::new(Self {
             has_command_auth: false,
             uses_codex_backend: false,
+            has_provider_models_endpoint: false,
+            responses: Mutex::new(responses.into()),
+            fetch_count: AtomicUsize::new(0),
+            observed_proxy_policy: Mutex::new(None),
+        })
+    }
+
+    /// A local/OSS provider that serves its own `/models` endpoint and has no
+    /// Codex backend or command auth.
+    fn local_provider(responses: Vec<Vec<ModelInfo>>) -> Arc<Self> {
+        Arc::new(Self {
+            has_command_auth: false,
+            uses_codex_backend: false,
+            has_provider_models_endpoint: true,
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
             observed_proxy_policy: Mutex::new(None),
@@ -162,6 +178,10 @@ impl ExternalAuth for TestUnresolvedExternalApiKeyAuth {
 impl ModelsEndpointClient for TestModelsEndpoint {
     fn has_command_auth(&self) -> bool {
         self.has_command_auth
+    }
+
+    fn has_provider_models_endpoint(&self) -> bool {
+        self.has_provider_models_endpoint
     }
 
     fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
@@ -672,6 +692,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
     let endpoint = Arc::new(TestModelsEndpoint {
         has_command_auth: true,
         uses_codex_backend: false,
+        has_provider_models_endpoint: false,
         responses: Mutex::new(vec![remote_models.clone()].into()),
         fetch_count: AtomicUsize::new(0),
         observed_proxy_policy: Mutex::new(None),
@@ -902,6 +923,78 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
     );
 }
 
+#[tokio::test]
+async fn refresh_available_models_fetches_for_local_provider_endpoint() {
+    // A local/OSS provider has no Codex backend auth and no command auth, yet it
+    // serves its own /models endpoint and must still be refreshed (regression
+    // guard for the picker showing bundled OpenAI models for local providers).
+    let local_slug = "local-model-from-oss-server";
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::local_provider(vec![vec![remote_model(
+        local_slug,
+        "Local",
+        /*priority*/ 1,
+    )]]);
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("refresh should fetch from the local provider endpoint");
+
+    let cached_remote = manager.get_remote_models().await;
+    assert!(
+        cached_remote
+            .iter()
+            .any(|candidate| candidate.slug == local_slug),
+        "local provider endpoint should be refreshed even without backend auth"
+    );
+    assert_eq!(
+        endpoint.fetch_count(),
+        1,
+        "local provider endpoint should trigger a model fetch"
+    );
+}
+
+#[tokio::test]
+async fn refresh_available_models_replaces_catalog_for_local_provider_endpoint() {
+    // The local provider's response is authoritative: the bundled OpenAI
+    // catalog must be replaced, not merged, so /model shows only local models.
+    let local_models = vec![
+        remote_model("oss-alpha", "OSS Alpha", /*priority*/ 1),
+        remote_model("oss-beta", "OSS Beta", /*priority*/ 2),
+    ];
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::local_provider(vec![local_models.clone()]);
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .expect("refresh should fetch from the local provider endpoint");
+
+    let cached_remote = manager.get_remote_models().await;
+    assert_eq!(
+        cached_remote, local_models,
+        "local provider models should fully replace the bundled catalog"
+    );
+    let bundled = load_remote_models_from_file().expect("bundled models should parse");
+    assert!(
+        !cached_remote
+            .iter()
+            .any(|model| bundled.iter().any(|b| b.slug == model.slug)),
+        "no bundled OpenAI models should remain after a local provider refresh"
+    );
+}
+
 #[derive(Debug)]
 struct TestAuthAwareModelsEndpoint {
     auth_manager: Option<Arc<AuthManager>>,
@@ -947,6 +1040,10 @@ impl TestAuthAwareModelsEndpoint {
 
 impl ModelsEndpointClient for TestAuthAwareModelsEndpoint {
     fn has_command_auth(&self) -> bool {
+        false
+    }
+
+    fn has_provider_models_endpoint(&self) -> bool {
         false
     }
 

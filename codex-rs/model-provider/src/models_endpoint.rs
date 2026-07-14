@@ -23,6 +23,7 @@ use codex_login::default_client::build_default_reqwest_client_for_route_async;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
+use codex_models_manager::model_info::model_info_for_local_provider;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CoreResult;
@@ -30,6 +31,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::telemetry_transport_error_message;
 use http::HeaderMap;
+use serde::Deserialize;
 use tokio::time::timeout;
 
 use crate::auth::agent_identity_telemetry;
@@ -98,6 +100,7 @@ impl OpenAiModelsEndpoint {
             agent_identity_telemetry,
             auth_env: self.auth_env(),
         });
+        let has_provider_endpoint = self.provider_info.has_provider_models_endpoint();
         timeout(MODELS_REFRESH_TIMEOUT, async {
             let transport = self
                 .transport_builder
@@ -105,10 +108,19 @@ impl OpenAiModelsEndpoint {
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
-            client
-                .list_models(request_url, HeaderMap::new())
-                .await
-                .map_err(map_api_error)
+            if has_provider_endpoint {
+                let (body, etag) = client
+                    .fetch_models_response(request_url, HeaderMap::new())
+                    .await
+                    .map_err(map_api_error)?;
+                let models = parse_provider_models(&body)?;
+                Ok((models, etag))
+            } else {
+                client
+                    .list_models(request_url, HeaderMap::new())
+                    .await
+                    .map_err(map_api_error)
+            }
         })
         .await
         .map_err(|_| CodexErr::Timeout)?
@@ -126,6 +138,10 @@ impl OpenAiModelsEndpoint {
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
     fn has_command_auth(&self) -> bool {
         self.provider_info.has_command_auth()
+    }
+
+    fn has_provider_models_endpoint(&self) -> bool {
+        self.provider_info.has_provider_models_endpoint()
     }
 
     fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
@@ -147,6 +163,37 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
 
 type ModelsTransportFuture<'a> =
     Pin<Box<dyn Future<Output = std::io::Result<ReqwestTransport>> + Send + 'a>>;
+
+/// OpenAI-compatible `{"object":"list","data":[{"id":...}]}` models response.
+///
+/// Local OSS servers (Ollama, LM Studio) and most self-hosted OpenAI-compatible
+/// endpoints return this minimal shape rather than the rich `ModelsResponse` the
+/// Codex backend returns, so we decode it ourselves and synthesize picker-ready
+/// metadata for each model id.
+#[derive(Deserialize)]
+struct ProviderModelsResponse {
+    #[serde(default)]
+    data: Vec<ProviderModel>,
+}
+
+#[derive(Deserialize)]
+struct ProviderModel {
+    id: String,
+}
+
+fn parse_provider_models(body: &[u8]) -> CoreResult<Vec<ModelInfo>> {
+    let response: ProviderModelsResponse = serde_json::from_slice(body).map_err(|err| {
+        map_api_error(codex_api::ApiError::Stream(format!(
+            "failed to decode provider models response: {err}; body: {}",
+            String::from_utf8_lossy(body)
+        )))
+    })?;
+    Ok(response
+        .data
+        .into_iter()
+        .map(|model| model_info_for_local_provider(&model.id))
+        .collect())
+}
 
 /// Builds the concrete transport selected for one models request.
 ///
@@ -285,9 +332,13 @@ mod tests {
     use super::*;
     use codex_http_client::OutboundProxyPolicy;
     use codex_login::default_client::build_reqwest_client;
+    use codex_model_provider_info::WireApi;
+    use codex_model_provider_info::create_oss_provider_with_base_url;
     use codex_protocol::config_types::ModelProviderAuthInfo;
+    use codex_protocol::openai_models::ModelVisibility;
     use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
@@ -393,5 +444,63 @@ mod tests {
                 format!("{}/models?client_version=0.0.0", server.uri()),
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn oss_provider_lists_models_from_openai_compat_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param("client_version", "0.0.0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "object": "list",
+                    "data": [
+                        {"id": "llama3.2", "object": "model", "owned_by": "library"},
+                        {"id": "qwen2.5-coder", "object": "model"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: create_oss_provider_with_base_url(
+                &format!("{}/v1", server.uri()),
+                WireApi::Responses,
+            ),
+            auth_manager: None,
+            transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
+        };
+
+        let (models, _etag) = endpoint
+            .list_models(
+                "0.0.0",
+                HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+            )
+            .await
+            .expect("OSS models request should succeed and parse");
+
+        let slugs: Vec<&str> = models.iter().map(|model| model.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["llama3.2", "qwen2.5-coder"]);
+        // Local provider models must be picker-visible so they show in /model.
+        assert!(models
+            .iter()
+            .all(|model| model.visibility == ModelVisibility::List));
+    }
+
+    #[test]
+    fn parse_provider_models_decodes_openai_compat_shape() {
+        let body = br#"{"object":"list","data":[{"id":"llama3.2"},{"id":"phi4"}]}"#;
+        let models = parse_provider_models(body).expect("compat body should parse");
+        assert_eq!(
+            models.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(),
+            vec!["llama3.2", "phi4"]
+        );
+
+        // Missing `data` yields an empty list rather than an error.
+        let empty = parse_provider_models(br#"{"object":"list"}"#).expect("empty compat body ok");
+        assert!(empty.is_empty());
     }
 }

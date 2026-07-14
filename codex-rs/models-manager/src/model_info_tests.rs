@@ -207,3 +207,17 @@ fn model_context_window_uses_model_value_without_override() {
 
     assert_eq!(updated, model);
 }
+
+#[test]
+fn local_provider_model_is_picker_visible_without_warn_metadata() {
+    let info = model_info_for_local_provider("llama3.2");
+
+    // Picker visibility is driven by `visibility == List`; local models must be
+    // visible so they appear in /model and can be marked default.
+    assert_eq!(info.visibility, ModelVisibility::List);
+    assert_eq!(info.slug, "llama3.2");
+    assert_eq!(info.display_name, "llama3.2");
+    // Local models are real provider-discovered entries, not fallback metadata.
+    assert!(!info.used_fallback_model_metadata);
+    assert!(info.supported_in_api);
+}

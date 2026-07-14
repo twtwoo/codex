@@ -35,6 +35,11 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
     /// Returns whether this provider can authenticate command-scoped requests.
     fn has_command_auth(&self) -> bool;
 
+    /// Returns whether this provider serves its own OpenAI-compatible `/models`
+    /// endpoint that should be queried independently of Codex backend auth
+    /// (e.g. a local OSS provider such as Ollama or LM Studio).
+    fn has_provider_models_endpoint(&self) -> bool;
+
     /// Returns whether the currently resolved auth can use Codex backend-only models.
     fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool>;
 
@@ -411,7 +416,9 @@ impl OpenAiModelsManager {
     }
 
     async fn should_refresh_models(&self) -> bool {
-        self.endpoint_client.uses_codex_backend().await || self.endpoint_client.has_command_auth()
+        self.endpoint_client.uses_codex_backend().await
+            || self.endpoint_client.has_command_auth()
+            || self.endpoint_client.has_provider_models_endpoint()
     }
 
     async fn get_etag(&self) -> Option<String> {
@@ -420,17 +427,22 @@ impl OpenAiModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        // Use the remote models list as the source of truth if it contains at least one
-        // non-hidden model and the user is using ChatGPT auth.
-        let should_use_remote_models_only = !models.is_empty()
-            && models
-                .iter()
-                .any(|model| model.visibility == ModelVisibility::List)
-            && self.auth_manager.as_ref().is_some_and(|auth_manager| {
-                auth_manager
-                    .auth_mode()
-                    .is_some_and(AuthMode::has_chatgpt_account)
-            });
+        // Use the remote models list as the source of truth when:
+        //  - the provider serves its own `/models` endpoint (e.g. a local OSS
+        //    provider), whose response is authoritative for that provider — even
+        //    when empty, so the bundled OpenAI catalog never leaks into it; or
+        //  - it contains at least one non-hidden model and the user is using
+        //    ChatGPT auth (the Codex backend catalog).
+        let should_use_remote_models_only = self.endpoint_client.has_provider_models_endpoint()
+            || (!models.is_empty()
+                && models
+                    .iter()
+                    .any(|model| model.visibility == ModelVisibility::List)
+                && self.auth_manager.as_ref().is_some_and(|auth_manager| {
+                    auth_manager
+                        .auth_mode()
+                        .is_some_and(AuthMode::has_chatgpt_account)
+                }));
         if should_use_remote_models_only {
             *self.remote_models.write().await = models;
             return;

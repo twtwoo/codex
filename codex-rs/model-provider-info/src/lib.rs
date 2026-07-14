@@ -418,6 +418,19 @@ impl ModelProviderInfo {
     pub fn has_command_auth(&self) -> bool {
         self.auth.is_some()
     }
+
+    /// Returns whether this provider serves its own OpenAI-compatible `/models`
+    /// endpoint that should be queried independently of Codex backend auth.
+    ///
+    /// The OpenAI-hosted backend relies on Codex/backend auth to list models
+    /// (handled separately via `uses_codex_backend`), and Amazon Bedrock does
+    /// not expose `/models` over the OpenAI-compatible surface. Any other
+    /// provider with a base URL — local OSS servers like Ollama or LM Studio,
+    /// or self-hosted/custom endpoints — exposes its own `/models`, which is
+    /// typically open and worth refreshing even without backend auth.
+    pub fn has_provider_models_endpoint(&self) -> bool {
+        self.base_url.is_some() && !self.is_openai() && !self.is_amazon_bedrock()
+    }
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
